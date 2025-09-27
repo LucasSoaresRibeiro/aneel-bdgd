@@ -88,9 +88,9 @@ Before downloading, you can find out what datasets are available.
 1.  Double-click `run_mapper.bat`.
     -   You can also run it from the command line and pass optional parameters to override the settings in `config.py`. The order of parameters is `COMPANY_FILTER`, `DATE_FILTER`, `GRID_CELL_SIZE`, and `OUTPUT_FILENAME`. If you want to skip a parameter but provide subsequent ones, use empty quotes `""`.
     -   **Examples:**
-        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2023" "10000" "output/aneel_bdgd_ceral_10000m.html"`
-        -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "10000" "output/aneel_bdgd_energisa_10000m.html"`
-        -   `.\run_mapper.bat "Light" "2024-12-31" "10000" "output/aneel_bdgd_light_5000m.html"`
+        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2023" "50" "output/aneel_bdgd_ceral_50km.html"`
+        -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "50" "output/aneel_bdgd_energisa_50km.html"`
+        -   `.\run_mapper.bat "Light" "2024-12-31" "50" "output/aneel_bdgd_light_50km.html"`
         -   `.\run_mapper.bat "Energisa"` (only overrides COMPANY_FILTER)
 2.  The script will activate the environment and start the full process based on your `config.py` settings (or overridden parameters):
     -   It will download the filtered `.zip` files (this can take a long time).

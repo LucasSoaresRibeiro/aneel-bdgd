@@ -172,6 +172,7 @@ class ANEEL_Pipeline:
         
         if config.GRID_CELL_UNITS.lower() == 'meters':
             points_data = points_data.to_crs(config.TARGET_CRS_EPSG)
+            grid_cell_size *= 1000  # Convert km to meters
 
         xmin, ymin, xmax, ymax = points_data.total_bounds
         grid_cells = [

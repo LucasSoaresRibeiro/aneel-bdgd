@@ -37,10 +37,10 @@ AGGREGATION_FUNCTION = 'sum'
 
 # --- Grid Map Parameters ---
 # The size of each square grid cell for the aggregation map.
-# GRID_CELL_SIZE = 10000  # 10000 = 10km x 10km grid
-# GRID_CELL_SIZE = 5000  # 5000 = 5km x 5km grid
-# GRID_CELL_SIZE = 3000  # 3000 = 3km x 3km grid
-GRID_CELL_SIZE = 1000  # 1000 = 1km x 1km grid
+# GRID_CELL_SIZE = 10  # 10 = 10km x 10km grid
+# GRID_CELL_SIZE = 5  # 5 = 5km x 5km grid
+# GRID_CELL_SIZE = 3  # 3 = 3km x 3km grid
+GRID_CELL_SIZE = 1  # 1 = 1km x 1km grid
 
 # The units for the grid cell size ('meters' or 'degrees'). 'meters' is recommended.
 GRID_CELL_UNITS = 'meters'
