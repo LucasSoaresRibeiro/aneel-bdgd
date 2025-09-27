@@ -159,10 +159,13 @@ class ANEEL_Pipeline:
 
     def generate_grid_map(self, grid_cell_size_arg=None):
         """Generates an advanced interactive grid map using settings from config.py."""
-        if self.processed_gdf.empty: logger.warning("Cannot generate map: No data available."); return None
+        if self.processed_gdf.empty: 
+            logger.warning("Cannot generate map: No data available.")
+            return None
         
         grid_cell_size = grid_cell_size_arg if grid_cell_size_arg is not None else config.GRID_CELL_SIZE
-        agg_col = config.AGGREGATION_COLUMN; agg_func = config.AGGREGATION_FUNCTION.lower()
+        agg_col = config.AGGREGATION_COLUMN
+        agg_func = config.AGGREGATION_FUNCTION.lower()
         
         logger.info(f"\nGenerating interactive grid map: '{agg_func}' of '{agg_col}' per cell...")
         points_data = self.processed_gdf.copy()
@@ -171,15 +174,28 @@ class ANEEL_Pipeline:
             points_data = points_data.to_crs(config.TARGET_CRS_EPSG)
 
         xmin, ymin, xmax, ymax = points_data.total_bounds
-        grid_cells = [Polygon([(x0, y0), (x0 + grid_cell_size, y0), (x0 + grid_cell_size, y0 + grid_cell_size), (x0, y0 + grid_cell_size)]) for x0 in np.arange(xmin, xmax, grid_cell_size) for y0 in np.arange(ymin, ymax, grid_cell_size)]
+        grid_cells = [
+            Polygon([
+                (x0, y0), 
+                (x0 + grid_cell_size, y0), 
+                (x0 + grid_cell_size, y0 + grid_cell_size), 
+                (x0, y0 + grid_cell_size)
+            ]) 
+            for x0 in np.arange(xmin, xmax, grid_cell_size) 
+            for y0 in np.arange(ymin, ymax, grid_cell_size)
+        ]
         grid = gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs=points_data.crs)
         merged = gpd.sjoin(points_data, grid, how='left', predicate='within')
 
+        # Aggregation logic
         if agg_func == 'count':
             agg = merged.groupby('index_right').agg(point_count=('geometry', 'count'))
             map_col = 'point_count'
         else:
-            agg = merged.groupby('index_right').agg(agg_result=(agg_col, agg_func), point_count=('geometry', 'count')).rename(columns={'agg_result': agg_col})
+            agg = merged.groupby('index_right').agg(
+                agg_result=(agg_col, agg_func), 
+                point_count=('geometry', 'count')
+            ).rename(columns={'agg_result': agg_col})
             map_col = agg_col
 
         grid_with_data = grid.merge(agg, left_index=True, right_index=True, how='left').fillna(0)
@@ -187,6 +203,7 @@ class ANEEL_Pipeline:
         
         grid_for_map = grid_with_data.to_crs(epsg=4326)
         
+        # Calculate map center
         try:
             map_center_projected = grid_for_map.to_crs(config.TARGET_CRS_EPSG).centroid.union_all().centroid
             map_center_gdf = gpd.GeoDataFrame(geometry=[map_center_projected], crs=config.TARGET_CRS_EPSG).to_crs(epsg=4326)
@@ -196,25 +213,59 @@ class ANEEL_Pipeline:
             
         m = folium.Map(location=map_center, zoom_start=6, tiles=None)
 
-        folium.TileLayer('OpenStreetMap', name='Street Map').add_to(m); folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Esri Satellite').add_to(m); folium.TileLayer('CartoDB positron', name='Light Map').add_to(m)
+        # Add base layers
+        folium.TileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 
+            attr='Esri', 
+            name='Esri Satellite'
+        ).add_to(m)
+        folium.TileLayer('CartoDB positron', name='Light Map').add_to(m)
+        folium.TileLayer('OpenStreetMap', name='Street Map').add_to(m)
         
-        choropleth_data = pd.DataFrame(grid_for_map.drop(columns='geometry')).reset_index()
-
-        # --- THIS IS THE CORRECTED CHOROPLETH CALL ---
+        # --- FIXED APPROACH: Reset index and create proper ID column ---
+        grid_for_map = grid_for_map.reset_index(drop=True).reset_index()
+        grid_for_map['grid_id'] = grid_for_map.index  # Create explicit ID column
+        
+        # Debug: Print data structure (remove in production)
+        logger.debug(f"Grid data columns: {grid_for_map.columns.tolist()}")
+        logger.debug(f"Map column '{map_col}' data type: {grid_for_map[map_col].dtype}")
+        logger.debug(f"Map column '{map_col}' sample values: {grid_for_map[map_col].head().tolist()}")
+        logger.debug(f"Map column '{map_col}' min/max: {grid_for_map[map_col].min()}/{grid_for_map[map_col].max()}")
+        
+        # Ensure numeric data for choropleth
+        grid_for_map[map_col] = pd.to_numeric(grid_for_map[map_col], errors='coerce').fillna(0)
+        
+        # Create choropleth with proper data structure
         folium.Choropleth(
-            geo_data=grid_for_map.to_json(), # Pass the GeoDataFrame directly
+            geo_data=grid_for_map.to_json(),  # Convert to GeoJSON properly
             name=f'Aggregated {map_col}',
-            data=choropleth_data,
-            columns=['index', map_col], # Use the new 'index' column as the key
-            key_on='feature.id',        # Folium links this to the GeoDataFrame's index
+            data=grid_for_map,
+            columns=['grid_id', map_col],  # Use explicit grid_id
+            key_on='feature.id',  # Match with GeoJSON feature id
             fill_color='YlOrRd',
             fill_opacity=0.7,
             line_opacity=0.2,
             legend_name=f'{agg_func.capitalize()} of {map_col} per Grid Cell',
+            nan_fill_color='white',  # Handle NaN values
+            nan_fill_opacity=0.1
         ).add_to(m)
 
-        tooltip = folium.GeoJsonTooltip(fields=[map_col, 'point_count'], aliases=[f'{map_col}:', 'Point Count:'])
-        folium.GeoJson(grid_for_map, style_function=lambda x: {'fillOpacity': 0, 'weight': 0}, tooltip=tooltip).add_to(m)
+        # Add interactive tooltips
+        tooltip = folium.GeoJsonTooltip(
+            fields=[map_col, 'point_count'], 
+            aliases=[f'{map_col}:', 'Point Count:'],
+            localize=True
+        )
+        
+        folium.GeoJson(
+            grid_for_map,
+            style_function=lambda x: {
+                'fillOpacity': 0, 
+                'weight': 0.5,
+                'color': 'black'
+            },
+            tooltip=tooltip
+        ).add_to(m)
 
         folium.LayerControl().add_to(m)
         return m
