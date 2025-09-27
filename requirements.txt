@@ -1,0 +1,11 @@
+requests
+geopandas
+fiona
+pyproj
+shapely
+folium
+tqdm
+pandas
+matplotlib
+sqlalchemy
+geoalchemy2
