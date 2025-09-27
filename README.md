@@ -4,6 +4,13 @@ This project is a standalone Python application that automates the entire workfl
 
 It uses the official ANEEL Open Data API to find and download File Geodatabase (FGDB) datasets, processes the raw data in memory to join consumer information with spatial locations, performs energy consumption analytics, and generates a final, interactive thematic map that can be opened in any web browser.
 
+## Sample Generated Maps
+
+- [aneel_bdgd_ceral_1km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_1km.html)
+- [aneel_bdgd_ceral_20km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_20km.html)
+- [aneel_bdgd_ceral_40km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_40km.html)
+- [aneel_bdgd_energisa_50km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_energisa_50km.html)
+
 ## Energy Distribution Companies in Brazil
 
 Check these online maps to discover energy distribution companies from Brazil:
