@@ -50,4 +50,3 @@ ECHO.
 ECHO --- Script Finished ---
 
 endlocal
-PAUSE

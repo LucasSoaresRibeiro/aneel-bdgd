@@ -2,3 +2,4 @@ data/downloads/*.zip
 data/extracted/*.gdb
 *.pyc
 data/extracted/aneel_data.db
+data/extracted/aneel_data.db-journal
