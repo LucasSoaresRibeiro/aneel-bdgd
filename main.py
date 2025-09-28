@@ -9,12 +9,14 @@ import fiona
 import warnings
 import numpy as np
 import sqlalchemy
-import shapely.wkb as wkb
+from sqlalchemy import create_engine, text, event
 from shapely.geometry import Polygon
 import folium
 from tqdm import tqdm
 import time
 import argparse
+import pyproj # <-- FIX: Add this import
+import branca.colormap as cm
 
 # Import settings from the configuration file
 import config
@@ -29,35 +31,86 @@ def is_valid_geometry(geom):
     return geom is not None and not geom.is_empty and geom.is_valid
 
 class ANEEL_Pipeline:
-    """
-    A unified pipeline to download, process, and map ANEEL BDGD data.
-    """
     def __init__(self):
         self.session = requests.Session()
         self.api_base = "https://dadosabertos-aneel.opendata.arcgis.com/api/search/v1/collections/dataset/items"
+        self.db_path = os.path.join(config.EXTRACT_DIR, 'aneel_data.db')
+        self.engine = None
+        self.base_crs = None
+        self.spatialite_path = None
         os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
         os.makedirs(config.EXTRACT_DIR, exist_ok=True)
-        self.processed_gdf = gpd.GeoDataFrame()
+
+    def _load_spatialite(self, dbapi_conn, connection_record):
+        if self.spatialite_path:
+            dbapi_conn.enable_load_extension(True)
+            dbapi_conn.load_extension(self.spatialite_path)
+
+    def _initialize_database(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+            logger.info(f"Removed existing database at {self.db_path}")
+        possible_paths = ['mod_spatialite', '/usr/lib/x86_64-linux-gnu/mod_spatialite.so', '/usr/local/lib/mod_spatialite.so']
+        temp_engine = create_engine(f'sqlite:///')
+        for path in possible_paths:
+            try:
+                with temp_engine.connect() as conn:
+                    conn.connection.enable_load_extension(True)
+                    conn.connection.load_extension(path)
+                self.spatialite_path = path
+                logger.info(f"Successfully located SpatiaLite at: {path}")
+                break
+            except Exception as e:
+                logger.debug(f"SpatiaLite not found at {path}: {e}")
+        if not self.spatialite_path:
+            logger.error("FATAL: SpatiaLite extension could not be found. Please ensure it's installed correctly.")
+            sys.exit(1)
+        self.engine = create_engine(f'sqlite:///{self.db_path}')
+        event.listen(self.engine, "connect", self._load_spatialite)
+        with self.engine.connect() as conn:
+            conn.execute(text("SELECT InitSpatialMetaData(1);"))
+            logger.info("Database initialized with SpatiaLite metadata tables.")
 
     def search_and_filter(self, company_filter, date_filter):
         logger.info("Searching for all File Geodatabase datasets...")
         all_features = []
         startindex = 1
+        max_retries = 3
         while True:
             params = {'type': "File Geodatabase", 'limit': 100, 'startindex': startindex}
-            response = self.session.get(self.api_base, params=params); response.raise_for_status()
-            data = response.json(); features = data.get('features', [])
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = self.session.get(self.api_base, params=params, timeout=30)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"API request failed on attempt {attempt + 1}/{max_retries}. Retrying... Error: {e}")
+                    time.sleep(2)
+            if response is None:
+                logger.error("API requests failed after multiple retries. Aborting search.")
+                return []
+            data = response.json()
+            features = data.get('features', [])
             if not features: break
             all_features.extend(features)
             if len(features) < 100: break
-            startindex += 100; time.sleep(0.5)
-        logger.info(f"Found {len(all_features)} total datasets. Applying filters...")
+            startindex += 100
+            time.sleep(0.5)
+        logger.info(f"Found {len(all_features)} total datasets from API. Applying filters...")
         filtered_features = []
+        company_upper = company_filter.upper() if company_filter else ""
+        date_upper = date_filter.upper() if date_filter else ""
         for feature in all_features:
-            props = feature['properties']; title = props.get('title', '').upper(); name = props.get('name', '').upper()
-            if company_filter and company_filter.upper() not in title and company_filter.upper() not in name: continue
-            if date_filter and date_filter not in name: continue
+            if not feature.get('id'): continue
+            props = feature.get('properties', {})
+            if company_upper:
+                searchable_content = " ".join([props.get('title', ''), props.get('name', ''), " ".join(props.get('tags', []))]).upper()
+                if company_upper not in searchable_content: continue
+            if date_upper:
+                if date_upper not in props.get('name', '').upper(): continue
             filtered_features.append(feature)
+        logger.info(f"Found {len(filtered_features)} datasets matching your criteria after filtering.")
         return filtered_features
 
     def download_and_extract_from_features(self, features):
@@ -91,183 +144,160 @@ class ANEEL_Pipeline:
         return list(set(extracted_gdb_paths))
 
     def load_and_union_data(self, gdb_paths):
-        logger.info("\n--- Loading and Unioning Data with SQLite Optimization ---")
-        engine = sqlalchemy.create_engine("sqlite:///:memory:")
-        base_crs = None
-        all_joined_gdfs = []
-
+        logger.info("\n--- Loading and Unioning Data with Disk-Based SQLite/SpatiaLite ---")
+        self._initialize_database()
+        data_was_inserted = False
+        if config.REPROJECT_TO_WGS84:
+            self.base_crs = 'EPSG:4326'
+            logger.info(f"Configuration set to reproject all geometries to CRS: {self.base_crs}")
+        else:
+            self.base_crs = None
+            logger.info("Configuration set to use original CRS from source files.")
+        def to_wkb_safe(geom):
+            if not is_valid_geometry(geom): return None
+            try: return geom.wkb
+            except Exception: return None
         for gdb_path in gdb_paths:
             logger.info(f"\n--- Processing: {os.path.basename(gdb_path)} ---")
             try:
                 with fiona.open(gdb_path, 'r', layer=config.SPATIAL_LAYER) as source:
-                    spatial_gdf = gpd.GeoDataFrame.from_features([f for f in source], crs=source.crs)
-                
-                if base_crs is None: base_crs = spatial_gdf.crs; logger.info(f"  - Base CRS established as: {base_crs.name}")
-                if spatial_gdf.crs != base_crs: spatial_gdf = spatial_gdf.to_crs(base_crs)
-                
-                spatial_gdf = spatial_gdf[spatial_gdf['geometry'].apply(is_valid_geometry)]
-                if spatial_gdf.empty: logger.warning(f"  - No valid geometries in {config.SPATIAL_LAYER}. Skipping."); continue
-                
+                    if self.base_crs is None and not config.REPROJECT_TO_WGS84:
+                        self.base_crs = source.crs
+                        logger.info(f"Base CRS for pipeline established as: {str(self.base_crs)}")
+                    spatial_gdf = gpd.GeoDataFrame.from_features(source, crs=source.crs)
+                    spatial_gdf = spatial_gdf[spatial_gdf['geometry'].apply(is_valid_geometry)]
+                    if spatial_gdf.empty:
+                        logger.warning("  - No valid geometries found in source. Skipping."); continue
+                    if config.REPROJECT_TO_WGS84 and spatial_gdf.crs.to_epsg() != 4326:
+                        logger.info(f"  - Reprojecting from {spatial_gdf.crs.name} to EPSG:4326...")
+                        spatial_gdf = spatial_gdf.to_crs('EPSG:4326')
+                    elif not config.REPROJECT_TO_WGS84 and spatial_gdf.crs != self.base_crs:
+                        logger.warning(f"  - CRS mismatch! Expected {str(self.base_crs)} but found {spatial_gdf.crs.name}. Geodetic errors may occur.")
+                    spatial_gdf['geometry'] = spatial_gdf['geometry'].apply(to_wkb_safe)
+                    spatial_gdf.dropna(subset=['geometry'], inplace=True)
+                    if spatial_gdf.empty:
+                        logger.warning("  - No valid geometries remained after conversion. Skipping."); continue
+                    spatial_gdf.to_sql('spatial_temp', self.engine, if_exists='replace', index=False, dtype={'geometry': sqlalchemy.types.BLOB})
                 consumer_dfs = [gpd.read_file(gdb_path, layer=t) for t in config.CONSUMER_LAYERS if t in fiona.listlayers(gdb_path)]
-                if not consumer_dfs: logger.warning(f"  - No consumer layers found. Skipping."); continue
+                if not consumer_dfs: logger.warning("  - No consumer layers found. Skipping."); continue
                 consumer_df = pd.concat(consumer_dfs, ignore_index=True)
-                
-                spatial_gdf[config.SPATIAL_KEY] = spatial_gdf[config.SPATIAL_KEY].astype(str)
-                consumer_df[config.CONSUMER_KEY] = consumer_df[config.CONSUMER_KEY].astype(str)
-
-                spatial_gdf['geometry_wkb'] = spatial_gdf['geometry'].apply(wkb.dumps)
-                spatial_df_no_geom = spatial_gdf.drop(columns='geometry')
-
-                spatial_df_no_geom.to_sql("spatial_temp", engine, if_exists='replace', index=False)
-                consumer_df.to_sql("consumer_temp", engine, if_exists='replace', index=False)
-
-                join_query = f"""
-                    SELECT s.*, c.* FROM "spatial_temp" AS s
-                    INNER JOIN "consumer_temp" AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}"
-                """
-                joined_df = pd.read_sql(join_query, engine)
-                
-                # Check for duplicate columns after join and remove them
-                joined_df = joined_df.loc[:,~joined_df.columns.duplicated()]
-
-                joined_gdf = gpd.GeoDataFrame(joined_df, geometry=joined_df['geometry_wkb'].apply(wkb.loads), crs=base_crs)
-                joined_gdf = joined_gdf.drop(columns='geometry_wkb')
-                
-                all_joined_gdfs.append(joined_gdf)
-                logger.info(f"  - Successfully processed and joined {len(joined_gdf)} records.")
+                consumer_df.to_sql('consumer_temp', self.engine, if_exists='replace', index=False)
+                with self.engine.connect() as conn:
+                    trans = conn.begin()
+                    try:
+                        inspector = sqlalchemy.inspect(self.engine)
+                        if not inspector.has_table("processed_data"):
+                            join_query = f"""CREATE TABLE processed_data AS SELECT s.*, c.* FROM spatial_temp AS s INNER JOIN consumer_temp AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}" """
+                        else:
+                            join_query = f"""INSERT INTO processed_data SELECT s.*, c.* FROM spatial_temp AS s INNER JOIN consumer_temp AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}" """
+                        conn.execute(text(join_query))
+                        trans.commit()
+                        data_was_inserted = True
+                        count_query = "SELECT count(*) FROM processed_data"
+                        total_records = conn.execute(text(count_query)).scalar()
+                        logger.info(f"  - Successfully joined data. Total records now: {total_records}")
+                    except Exception as e:
+                        trans.rollback(); logger.error(f"  - FAILED to join data in DB. Error: {e}")
             except Exception as e:
-                logger.error(f"  - FAILED to process GDB. Error: {e}")
-        
-        if all_joined_gdfs:
-            self.processed_gdf = pd.concat(all_joined_gdfs, ignore_index=True)
-            self.processed_gdf = gpd.GeoDataFrame(self.processed_gdf, crs=base_crs, geometry='geometry')
-            logger.info(f"\nUnion complete. Total records: {len(self.processed_gdf)}. Final CRS: {self.processed_gdf.crs.name}")
-        else:
-            logger.warning("\nNo data was successfully processed.")
+                logger.error(f"  - FAILED to process GDB file. Error: {e}")
+        if not data_was_inserted:
+            logger.warning("\nNo data was loaded. Skipping spatial index creation."); return self
+        with self.engine.connect() as conn:
+            logger.info("Creating spatial index on the final table...")
+            try:
+                trans = conn.begin()
+                # --- FIX: Use pyproj.CRS to safely handle different CRS object types ---
+                srid = pyproj.CRS(self.base_crs).to_epsg()
+                conn.execute(text("SELECT DiscardGeometryColumn('processed_data', 'geom');"))
+                conn.execute(text(f"SELECT AddGeometryColumn('processed_data', 'geom', {srid}, 'POINT', 2)"))
+                conn.execute(text(f"UPDATE processed_data SET geom = GeomFromWKB(geometry, {srid})"))
+                conn.execute(text("SELECT CreateSpatialIndex('processed_data', 'geom')"))
+                trans.commit()
+                logger.info(f"Spatial index created successfully with SRID: {srid}.")
+            except Exception as e:
+                trans.rollback(); logger.error(f"FAILED to create spatial index. Error: {e}")
         return self
 
     def process_analytics(self):
-        if self.processed_gdf.empty: logger.warning("Skipping analytics: No data available."); return self
-        logger.info("\nExecuting analytics on the unioned dataset...")
-        df = self.processed_gdf; ene_cols = [f'ENE_{str(i).zfill(2)}' for i in range(1, 13)]
-        for col in ene_cols:
-            if col not in df.columns: df[col] = 0
-        df[ene_cols] = df[ene_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-        df['ENE_TOT'] = df[ene_cols].sum(axis=1); df['ENE_MED'] = df['ENE_TOT'] / 12; df['DEM'] = pd.to_numeric(df.get('CAR_INST', 0), errors='coerce').fillna(0)
-        self.processed_gdf = df; logger.info("Analytics complete.")
+        if not self.engine: logger.warning("Skipping analytics: DB not available."); return self
+        logger.info("\n--- Executing analytics directly in the database ---")
+        ene_cols = [f'ENE_{str(i).zfill(2)}' for i in range(1, 13)]
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                conn.execute(text("ALTER TABLE processed_data ADD COLUMN ENE_TOT REAL;"))
+                conn.execute(text("ALTER TABLE processed_data ADD COLUMN ENE_MED REAL;"))
+                conn.execute(text("ALTER TABLE processed_data ADD COLUMN DEM REAL;"))
+                table_info = pd.read_sql("PRAGMA table_info(processed_data);", conn)
+                existing_cols = table_info['name'].tolist()
+                for col in ene_cols:
+                    if col not in existing_cols:
+                        conn.execute(text(f"ALTER TABLE processed_data ADD COLUMN {col} REAL DEFAULT 0;"))
+                sum_expression = " + ".join([f"COALESCE(CAST({col} AS REAL), 0)" for col in ene_cols])
+                conn.execute(text(f"UPDATE processed_data SET ENE_TOT = {sum_expression};"))
+                conn.execute(text("UPDATE processed_data SET ENE_MED = ENE_TOT / 12.0;"))
+                conn.execute(text("UPDATE processed_data SET DEM = COALESCE(CAST(CAR_INST AS REAL), 0);"))
+                trans.commit()
+                logger.info("Analytics complete. Columns ENE_TOT, ENE_MED, DEM created.")
+            except Exception as e:
+                trans.rollback(); logger.error(f"Failed to process analytics in database. Error: {e}")
         return self
 
     def generate_grid_map(self, grid_cell_size_arg=None):
-        """Generates an advanced interactive grid map using settings from config.py."""
-        if self.processed_gdf.empty: 
-            logger.warning("Cannot generate map: No data available.")
-            return None
-        
-        grid_cell_size = grid_cell_size_arg if grid_cell_size_arg is not None else config.GRID_CELL_SIZE
+        if not self.engine: 
+            logger.warning("Cannot generate map: DB not available."); return None
+        logger.info("\n--- Generating map using chunk-based grid aggregation ---")
+        grid_cell_size_km = grid_cell_size_arg if grid_cell_size_arg is not None else config.GRID_CELL_SIZE
         agg_col = config.AGGREGATION_COLUMN
         agg_func = config.AGGREGATION_FUNCTION.lower()
-        
-        logger.info(f"\nGenerating interactive grid map: '{agg_func}' of '{agg_col}' per cell...")
-        points_data = self.processed_gdf.copy()
-        
-        if config.GRID_CELL_UNITS.lower() == 'meters':
-            points_data = points_data.to_crs(config.TARGET_CRS_EPSG)
-            grid_cell_size *= 1000  # Convert km to meters
-
-        xmin, ymin, xmax, ymax = points_data.total_bounds
-        grid_cells = [
-            Polygon([
-                (x0, y0), 
-                (x0 + grid_cell_size, y0), 
-                (x0 + grid_cell_size, y0 + grid_cell_size), 
-                (x0, y0 + grid_cell_size)
-            ]) 
-            for x0 in np.arange(xmin, xmax, grid_cell_size) 
-            for y0 in np.arange(ymin, ymax, grid_cell_size)
-        ]
-        grid = gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs=points_data.crs)
-        merged = gpd.sjoin(points_data, grid, how='left', predicate='within')
-
-        # Aggregation logic
-        if agg_func == 'count':
-            agg = merged.groupby('index_right').agg(point_count=('geometry', 'count'))
-            map_col = 'point_count'
-        else:
-            agg = merged.groupby('index_right').agg(
-                agg_result=(agg_col, agg_func), 
-                point_count=('geometry', 'count')
-            ).rename(columns={'agg_result': agg_col})
-            map_col = agg_col
-
-        grid_with_data = grid.merge(agg, left_index=True, right_index=True, how='left').fillna(0)
-        grid_with_data = grid_with_data[grid_with_data['point_count'] > 0]
-        
-        grid_for_map = grid_with_data.to_crs(epsg=4326)
-        
-        # Calculate map center
-        try:
-            map_center_projected = grid_for_map.to_crs(config.TARGET_CRS_EPSG).centroid.union_all().centroid
-            map_center_gdf = gpd.GeoDataFrame(geometry=[map_center_projected], crs=config.TARGET_CRS_EPSG).to_crs(epsg=4326)
-            map_center = [map_center_gdf.geometry.y.iloc[0], map_center_gdf.geometry.x.iloc[0]]
-        except:
-            map_center = [grid_for_map.geometry.centroid.y.mean(), grid_for_map.geometry.centroid.x.mean()]
-            
-        m = folium.Map(location=map_center, zoom_start=6, tiles=None)
-
-        # Add base layers
-        folium.TileLayer(
-            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 
-            attr='Esri', 
-            name='Esri Satellite'
+        needs_transform = pyproj.CRS(self.base_crs).to_epsg() != 4326
+        with self.engine.connect() as conn:
+            bounds_query_geom = "Transform(geom, 4326)" if needs_transform else "geom"
+            query = text(f"SELECT Min(MbrMinX({bounds_query_geom})), Min(MbrMinY({bounds_query_geom})), Max(MbrMaxX({bounds_query_geom})), Max(MbrMaxY({bounds_query_geom})) FROM processed_data;")
+            try:
+                xmin, ymin, xmax, ymax = conn.execute(query).fetchone()
+            except sqlalchemy.exc.OperationalError as e:
+                logger.error(f"Could not calculate data bounds. Was the spatial index created correctly? Error: {e}"); return None
+        if not all((xmin, ymin, xmax, ymax)):
+            logger.warning("Could not determine data bounds from database. Cannot generate map."); return None
+        grid_cell_size_deg = grid_cell_size_km / 111.32
+        logger.info(f"Generating grid ({grid_cell_size_km}km ≈ {grid_cell_size_deg:.4f} degrees)...")
+        grid_cells = [Polygon([(x0, y0), (x0 + grid_cell_size_deg, y0), (x0 + grid_cell_size_deg, y0 + grid_cell_size_deg), (x0, y0 + grid_cell_size_deg)]) for x0 in np.arange(xmin, xmax, grid_cell_size_deg) for y0 in np.arange(ymin, ymax, grid_cell_size_deg)]
+        grid_gdf = gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs='EPSG:4326')
+        grid_gdf[agg_col] = 0; grid_gdf['point_count'] = 0
+        logger.info(f"Aggregating data for {len(grid_gdf)} grid cells...")
+        with self.engine.connect() as conn:
+            srid = pyproj.CRS(self.base_crs).to_epsg()
+            for i, cell in tqdm(grid_gdf.iterrows(), total=len(grid_gdf)):
+                cell_wkt = cell.geometry.wkt
+                st_contains_geom = f"Transform(GeomFromText('{cell_wkt}', 4326), {srid})" if needs_transform else f"GeomFromText('{cell_wkt}', 4326)"
+                query = text(f""" SELECT {agg_func.upper()}({agg_col}) as agg_val, COUNT(*) as p_count FROM processed_data WHERE ST_Contains({st_contains_geom}, geom); """)
+                result = conn.execute(query).fetchone()
+                agg_val, p_count = result if result else (0, 0)
+                if p_count > 0:
+                    grid_gdf.at[i, agg_col] = agg_val if agg_val is not None else 0
+                    grid_gdf.at[i, 'point_count'] = p_count
+        grid_with_data = grid_gdf[grid_gdf['point_count'] > 0].copy()
+        if grid_with_data.empty:
+            logger.warning("No data points fell within the grid. Cannot create map."); return None
+        map_center = [grid_with_data.geometry.centroid.y.mean(), grid_with_data.geometry.centroid.x.mean()]
+        m = folium.Map(location=map_center, zoom_start=6, tiles='CartoDB positron')
+        non_zero_data = grid_with_data[grid_with_data[agg_col] > 0]
+        min_val = non_zero_data[agg_col].min() if not non_zero_data.empty else 0
+        max_val = non_zero_data[agg_col].max() if not non_zero_data.empty else 0
+        if min_val == max_val: min_val = max_val * 0.9 if max_val > 0 else 0
+        colormap = cm.linear.YlOrRd_09.scale(min_val, max_val)
+        colormap.caption = f'{agg_func.capitalize()} of {agg_col} per Grid Cell'
+        def style_function(feature):
+            value = feature['properties'][agg_col]
+            if value > 0:
+                return {'fillColor': colormap(value), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
+            else:
+                return {'fillColor': '#D3D3D3', 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.5}
+        folium.GeoJson(grid_with_data, style_function=style_function, name='Aggregated Data',
+            tooltip=folium.GeoJsonTooltip(fields=[agg_col, 'point_count'], aliases=[f'{agg_col}:', 'Point Count:'], localize=True)
         ).add_to(m)
-        folium.TileLayer('CartoDB positron', name='Light Map').add_to(m)
-        folium.TileLayer('OpenStreetMap', name='Street Map').add_to(m)
-        
-        # --- FIXED APPROACH: Reset index and create proper ID column ---
-        grid_for_map = grid_for_map.reset_index(drop=True).reset_index()
-        grid_for_map['grid_id'] = grid_for_map.index  # Create explicit ID column
-        
-        # Debug: Print data structure (remove in production)
-        logger.debug(f"Grid data columns: {grid_for_map.columns.tolist()}")
-        logger.debug(f"Map column '{map_col}' data type: {grid_for_map[map_col].dtype}")
-        logger.debug(f"Map column '{map_col}' sample values: {grid_for_map[map_col].head().tolist()}")
-        logger.debug(f"Map column '{map_col}' min/max: {grid_for_map[map_col].min()}/{grid_for_map[map_col].max()}")
-        
-        # Ensure numeric data for choropleth
-        grid_for_map[map_col] = pd.to_numeric(grid_for_map[map_col], errors='coerce').fillna(0)
-        
-        # Create choropleth with proper data structure
-        folium.Choropleth(
-            geo_data=grid_for_map.to_json(),  # Convert to GeoJSON properly
-            name=f'Aggregated {map_col}',
-            data=grid_for_map,
-            columns=['grid_id', map_col],  # Use explicit grid_id
-            key_on='feature.id',  # Match with GeoJSON feature id
-            fill_color='YlOrRd',
-            fill_opacity=0.7,
-            line_opacity=0.2,
-            legend_name=f'{agg_func.capitalize()} of {map_col} per Grid Cell',
-            nan_fill_color='white',  # Handle NaN values
-            nan_fill_opacity=0.1
-        ).add_to(m)
-
-        # Add interactive tooltips
-        tooltip = folium.GeoJsonTooltip(
-            fields=[map_col, 'point_count'], 
-            aliases=[f'{map_col}:', 'Point Count:'],
-            localize=True
-        )
-        
-        folium.GeoJson(
-            grid_for_map,
-            style_function=lambda x: {
-                'fillOpacity': 0, 
-                'weight': 0.5,
-                'color': 'black'
-            },
-            tooltip=tooltip
-        ).add_to(m)
-
+        colormap.add_to(m)
         folium.LayerControl().add_to(m)
         return m
 
@@ -275,18 +305,27 @@ def run_full_pipeline(company_filter_arg=None, date_filter_arg=None, grid_size_a
     logger.info("--- Starting ANEEL BDGD Full Pipeline ---")
     pipeline = ANEEL_Pipeline()
 
-    company_filter = company_filter_arg if company_filter_arg is not None else config.COMPANY_FILTER
-    date_filter = date_filter_arg if date_filter_arg is not None else config.DATE_FILTER
+    # --- FIX: Use the argument only if it's a non-empty string, otherwise use the config ---
+    company_filter = company_filter_arg if company_filter_arg else config.COMPANY_FILTER
+    date_filter = date_filter_arg if date_filter_arg else config.DATE_FILTER
+    grid_size = grid_size_arg if grid_size_arg else config.GRID_CELL_SIZE
+    output_filename = output_filename_arg if output_filename_arg else config.OUTPUT_FILENAME
     
     features_to_download = pipeline.search_and_filter(company_filter, date_filter)
-    if config.MAX_DOWNLOADS: features_to_download = features_to_download[:config.MAX_DOWNLOADS]
+    if not features_to_download: 
+        logger.warning("No datasets found matching filters. Exiting.")
+        return
+
+    if config.MAX_DOWNLOADS: 
+        features_to_download = features_to_download[:config.MAX_DOWNLOADS]
+    
     gdb_paths = pipeline.download_and_extract_from_features(features_to_download)
     if gdb_paths:
         pipeline.load_and_union_data(gdb_paths)
         pipeline.process_analytics()
-        interactive_map = pipeline.generate_grid_map(grid_size_arg)
+        interactive_map = pipeline.generate_grid_map(grid_size) # Use the corrected variable
         if interactive_map:
-            output_filename = output_filename_arg if output_filename_arg is not None else config.OUTPUT_FILENAME
+            # Use the corrected variable
             os.makedirs(os.path.dirname(output_filename), exist_ok=True)
             interactive_map.save(output_filename)
             logger.info(f"\n--- SUCCESS ---")
@@ -318,12 +357,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ANEEL BDGD Downloader and Mapper")
     parser.add_argument("--company_filter", type=str, help="Filter by company name (e.g., 'Light').")
     parser.add_argument("--date_filter", type=str, help="Filter by date (e.g., '2024-12-31').")
-    parser.add_argument("--grid_size", type=float, help="Grid cell size in meters or degrees (e.g., 1000 for 1km).")
+    parser.add_argument("--grid_size", type=float, help="Grid cell size in kilometers (e.g., 1.0 for 1km).")
     parser.add_argument("--output_filename", type=str, help="Output HTML filename (e.g., 'output/map.html').")
     parser.add_argument("--search", action="store_true", help="Run in search mode to find datasets.")
-
     args = parser.parse_args()
-
     if args.search:
         company = args.company_filter if args.company_filter else ""
         date = args.date_filter if args.date_filter else ""

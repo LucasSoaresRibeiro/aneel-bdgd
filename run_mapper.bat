@@ -1,45 +1,53 @@
 @echo off
-TITLE ANEEL BDGD Mapper
+setlocal
+
 ECHO --- Running ANEEL BDGD Downloader and Mapper (Full Pipeline) ---
 ECHO This will download and process files based on your 'config.py' settings.
+ECHO Command-line arguments will override the settings in the config file.
 ECHO.
 
-REM Check if virtual environment exists
-IF NOT EXIST .venv (
-    ECHO Virtual environment not found. Please run 'setup_environment.bat' first.
+REM --- Define the name of the Conda environment ---
+SET "ENV_NAME=aneel_mapper_env"
+
+REM --- Activate the Conda environment ---
+ECHO Activating the environment...
+call conda activate %ENV_NAME%
+IF %ERRORLEVEL% NEQ 0 (
+    ECHO.
+    ECHO ERROR: Failed to activate the Conda environment '%ENV_NAME%'.
+    ECHO Please ensure you have run 'setup_environment.bat' successfully.
     PAUSE
     EXIT /B 1
 )
-
-ECHO Activating the environment...
-call .venv\Scripts\activate.bat
+ECHO.
 
 ECHO Running the main script (main.py)...
 ECHO This may take a long time depending on your filters and internet speed.
 
-set "COMPANY_FILTER_ARG="
-set "DATE_FILTER_ARG="
-set "GRID_SIZE_ARG="
-set "OUTPUT_FILENAME_FOR_MAIN_PY="
-set "OUTPUT_FILENAME_FOR_START_CMD=output\aneel_bdgd.html" REM Default from config.py
+REM --- Build the command dynamically to handle optional arguments ---
+set "CMD=python main.py"
 
-IF NOT "%1"=="" (
-    SET "COMPANY_FILTER_ARG=--company_filter %1"
+if not "%~1"=="" (
+    set "CMD=%CMD% --company_filter "%~1""
 )
-IF NOT "%2"=="" (
-    SET "DATE_FILTER_ARG=--date_filter %2"
+if not "%~2"=="" (
+    set "CMD=%CMD% --date_filter "%~2""
 )
-IF NOT "%3"=="" (
-    SET "GRID_SIZE_ARG=--grid_size %3"
+if not "%~3"=="" (
+    set "CMD=%CMD% --grid_size "%~3""
 )
-IF NOT "%4"=="" (
-    SET "OUTPUT_FILENAME_FOR_MAIN_PY=--output_filename %4"
-    SET "OUTPUT_FILENAME_FOR_START_CMD=%4"
+if not "%~4"=="" (
+    set "CMD=%CMD% --output_filename "%~4""
 )
 
-python main.py %COMPANY_FILTER_ARG% %DATE_FILTER_ARG% %GRID_SIZE_ARG% %OUTPUT_FILENAME_FOR_MAIN_PY%
+REM --- Execute the dynamically built command ---
+ECHO.
+ECHO Executing command: %CMD%
+ECHO.
+%CMD%
 
 ECHO.
 ECHO --- Script Finished ---
-start "" "%OUTPUT_FILENAME_FOR_START_CMD%"
+
+endlocal
 PAUSE

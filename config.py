@@ -56,3 +56,9 @@ EXTRACT_DIR = "data/extracted"
 
 # Name of the final interactive map file.
 OUTPUT_FILENAME = "output/aneel_bdgd.html"
+
+# --- GEOMETRY SETTINGS ---
+# Set to True to reproject all incoming geometries to WGS84 (EPSG:4326).
+# Set to False to keep the original CRS from the source files.
+# WARNING: Setting to False is only recommended if all your source files share the exact same CRS.
+REPROJECT_TO_WGS84 = False
