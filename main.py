@@ -146,17 +146,21 @@ class ANEEL_Pipeline:
     def load_and_union_data(self, gdb_paths):
         logger.info("\n--- Loading and Unioning Data with Disk-Based SQLite/SpatiaLite ---")
         self._initialize_database()
+        
         data_was_inserted = False
+        
         if config.REPROJECT_TO_WGS84:
             self.base_crs = 'EPSG:4326'
             logger.info(f"Configuration set to reproject all geometries to CRS: {self.base_crs}")
         else:
             self.base_crs = None
             logger.info("Configuration set to use original CRS from source files.")
+
         def to_wkb_safe(geom):
             if not is_valid_geometry(geom): return None
             try: return geom.wkb
             except Exception: return None
+
         for gdb_path in gdb_paths:
             logger.info(f"\n--- Processing: {os.path.basename(gdb_path)} ---")
             try:
@@ -164,32 +168,41 @@ class ANEEL_Pipeline:
                     if self.base_crs is None and not config.REPROJECT_TO_WGS84:
                         self.base_crs = source.crs
                         logger.info(f"Base CRS for pipeline established as: {str(self.base_crs)}")
+
                     spatial_gdf = gpd.GeoDataFrame.from_features(source, crs=source.crs)
                     spatial_gdf = spatial_gdf[spatial_gdf['geometry'].apply(is_valid_geometry)]
-                    if spatial_gdf.empty:
-                        logger.warning("  - No valid geometries found in source. Skipping."); continue
+                    if spatial_gdf.empty: logger.warning("  - No valid geometries in source. Skipping."); continue
+
                     if config.REPROJECT_TO_WGS84 and spatial_gdf.crs.to_epsg() != 4326:
                         logger.info(f"  - Reprojecting from {spatial_gdf.crs.name} to EPSG:4326...")
                         spatial_gdf = spatial_gdf.to_crs('EPSG:4326')
                     elif not config.REPROJECT_TO_WGS84 and spatial_gdf.crs != self.base_crs:
-                        logger.warning(f"  - CRS mismatch! Expected {str(self.base_crs)} but found {spatial_gdf.crs.name}. Geodetic errors may occur.")
+                        logger.warning(f"  - CRS mismatch! Expected {str(self.base_crs)} but found {spatial_gdf.crs.name}.")
+
                     spatial_gdf['geometry'] = spatial_gdf['geometry'].apply(to_wkb_safe)
                     spatial_gdf.dropna(subset=['geometry'], inplace=True)
-                    if spatial_gdf.empty:
-                        logger.warning("  - No valid geometries remained after conversion. Skipping."); continue
+                    if spatial_gdf.empty: logger.warning("  - No valid geometries after conversion. Skipping."); continue
                     spatial_gdf.to_sql('spatial_temp', self.engine, if_exists='replace', index=False, dtype={'geometry': sqlalchemy.types.BLOB})
+
                 consumer_dfs = [gpd.read_file(gdb_path, layer=t) for t in config.CONSUMER_LAYERS if t in fiona.listlayers(gdb_path)]
                 if not consumer_dfs: logger.warning("  - No consumer layers found. Skipping."); continue
                 consumer_df = pd.concat(consumer_dfs, ignore_index=True)
                 consumer_df.to_sql('consumer_temp', self.engine, if_exists='replace', index=False)
+
                 with self.engine.connect() as conn:
                     trans = conn.begin()
                     try:
+                        logger.info("  - Creating indexes on temporary tables for faster joins...")
+                        conn.execute(text(f'CREATE INDEX idx_spatial_key ON spatial_temp("{config.SPATIAL_KEY}");'))
+                        conn.execute(text(f'CREATE INDEX idx_consumer_key ON consumer_temp("{config.CONSUMER_KEY}");'))
+
                         inspector = sqlalchemy.inspect(self.engine)
                         if not inspector.has_table("processed_data"):
-                            join_query = f"""CREATE TABLE processed_data AS SELECT s.*, c.* FROM spatial_temp AS s INNER JOIN consumer_temp AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}" """
+                            join_query = f"""CREATE TABLE processed_data AS SELECT s.*, c.* FROM spatial_temp AS s INNER JOIN consumer_temp AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}";"""
                         else:
-                            join_query = f"""INSERT INTO processed_data SELECT s.*, c.* FROM spatial_temp AS s INNER JOIN consumer_temp AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}" """
+                            join_query = f"""INSERT INTO processed_data SELECT s.*, c.* FROM spatial_temp AS s INNER JOIN consumer_temp AS c ON s."{config.SPATIAL_KEY}" = c."{config.CONSUMER_KEY}";"""
+                        
+                        logger.info("  - Performing indexed join...")
                         conn.execute(text(join_query))
                         trans.commit()
                         data_was_inserted = True
@@ -200,22 +213,36 @@ class ANEEL_Pipeline:
                         trans.rollback(); logger.error(f"  - FAILED to join data in DB. Error: {e}")
             except Exception as e:
                 logger.error(f"  - FAILED to process GDB file. Error: {e}")
+        
         if not data_was_inserted:
             logger.warning("\nNo data was loaded. Skipping spatial index creation."); return self
+
         with self.engine.connect() as conn:
-            logger.info("Creating spatial index on the final table...")
+            logger.info("Creating spatial index and coordinate columns...")
             try:
                 trans = conn.begin()
-                # --- FIX: Use pyproj.CRS to safely handle different CRS object types ---
                 srid = pyproj.CRS(self.base_crs).to_epsg()
                 conn.execute(text("SELECT DiscardGeometryColumn('processed_data', 'geom');"))
                 conn.execute(text(f"SELECT AddGeometryColumn('processed_data', 'geom', {srid}, 'POINT', 2)"))
                 conn.execute(text(f"UPDATE processed_data SET geom = GeomFromWKB(geometry, {srid})"))
                 conn.execute(text("SELECT CreateSpatialIndex('processed_data', 'geom')"))
+                
+                # --- NEW: Add and populate latitude and longitude columns ---
+                logger.info("  - Pre-calculating longitude and latitude columns...")
+                conn.execute(text("ALTER TABLE processed_data ADD COLUMN longitude REAL;"))
+                conn.execute(text("ALTER TABLE processed_data ADD COLUMN latitude REAL;"))
+                
+                # Determine the geometry to use for coordinate extraction (transform if necessary)
+                coord_geom = "Transform(geom, 4326)" if srid != 4326 else "geom"
+                
+                # Populate the new columns
+                conn.execute(text(f"UPDATE processed_data SET longitude = ST_X({coord_geom});"))
+                conn.execute(text(f"UPDATE processed_data SET latitude = ST_Y({coord_geom});"))
+
                 trans.commit()
-                logger.info(f"Spatial index created successfully with SRID: {srid}.")
+                logger.info("Spatial index and coordinate columns created successfully.")
             except Exception as e:
-                trans.rollback(); logger.error(f"FAILED to create spatial index. Error: {e}")
+                trans.rollback(); logger.error(f"FAILED to create spatial index/columns. Error: {e}")
         return self
 
     def process_analytics(self):
@@ -243,7 +270,7 @@ class ANEEL_Pipeline:
                 trans.rollback(); logger.error(f"Failed to process analytics in database. Error: {e}")
         return self
 
-    def generate_grid_map(self, grid_cell_size_arg=None):
+    def generate_grid_map_v1(self, grid_cell_size_arg=None):
         if not self.engine: 
             logger.warning("Cannot generate map: DB not available."); return None
         logger.info("\n--- Generating map using chunk-based grid aggregation ---")
@@ -294,6 +321,195 @@ class ANEEL_Pipeline:
                 return {'fillColor': colormap(value), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
             else:
                 return {'fillColor': '#D3D3D3', 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.5}
+        folium.GeoJson(grid_with_data, style_function=style_function, name='Aggregated Data',
+            tooltip=folium.GeoJsonTooltip(fields=[agg_col, 'point_count'], aliases=[f'{agg_col}:', 'Point Count:'], localize=True)
+        ).add_to(m)
+        colormap.add_to(m)
+        folium.LayerControl().add_to(m)
+        return m
+
+    def generate_grid_map_v2_database(self, grid_cell_size_arg=None):
+        if not self.engine:
+            logger.warning("Cannot generate map: Database engine not available."); return None
+        logger.info("\n--- Generating map using high-performance in-database aggregation ---")
+        grid_cell_size_km = grid_cell_size_arg if grid_cell_size_arg is not None else config.GRID_CELL_SIZE
+        agg_col = config.AGGREGATION_COLUMN
+        agg_func = config.AGGREGATION_FUNCTION.lower()
+        
+        # 1. Get data bounds from the database
+        with self.engine.connect() as conn:
+            srid = pyproj.CRS(self.base_crs).to_epsg()
+            needs_transform = srid != 4326
+            bounds_query_geom = f"Transform(geom, 4326)" if needs_transform else "geom"
+            query = text(f"SELECT Min(MbrMinX({bounds_query_geom})), Min(MbrMinY({bounds_query_geom})), Max(MbrMaxX({bounds_query_geom})), Max(MbrMaxY({bounds_query_geom})) FROM processed_data;")
+            try:
+                xmin, ymin, xmax, ymax = conn.execute(query).fetchone()
+            except sqlalchemy.exc.OperationalError as e:
+                logger.error(f"Could not calculate data bounds. Was the spatial index created correctly? Error: {e}"); return None
+
+        if not all((xmin, ymin, xmax, ymax)):
+            logger.warning("Could not determine data bounds from database. Cannot generate map."); return None
+
+        # 2. Create grid cells in Python
+        grid_cell_size_deg = grid_cell_size_km / 111.32
+        logger.info(f"Generating {grid_cell_size_km}km grid cells...")
+        grid_cells = [Polygon([(x0, y0), (x0 + grid_cell_size_deg, y0), (x0 + grid_cell_size_deg, y0 + grid_cell_size_deg), (x0, y0 + grid_cell_size_deg)]) for x0 in np.arange(xmin, xmax, grid_cell_size_deg) for y0 in np.arange(ymin, ymax, grid_cell_size_deg)]
+        grid_gdf = gpd.GeoDataFrame(grid_cells, columns=['geometry'], crs='EPSG:4326')
+        grid_gdf['grid_id'] = range(len(grid_gdf)) # Add a unique ID for joining
+
+        # 3. Upload grid to a temporary spatial table in the database
+        logger.info(f"Uploading {len(grid_gdf)} grid cells to the database for processing...")
+        grid_gdf['geometry_wkb'] = grid_gdf['geometry'].apply(lambda geom: geom.wkb)
+        grid_gdf.drop(columns='geometry').to_sql('grid_temp', self.engine, if_exists='replace', index=False)
+
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                conn.execute(text("SELECT DiscardGeometryColumn('grid_temp', 'geom');"))
+                conn.execute(text(f"SELECT AddGeometryColumn('grid_temp', 'geom', 4326, 'POLYGON', 2)"))
+                conn.execute(text(f"UPDATE grid_temp SET geom = GeomFromWKB(geometry_wkb, 4326)"))
+                conn.execute(text("SELECT CreateSpatialIndex('grid_temp', 'geom')"))
+                trans.commit()
+                logger.info("Spatial index created on temporary grid table.")
+            except Exception as e:
+                trans.rollback(); logger.error(f"FAILED to create spatial grid table. Error: {e}"); return None
+
+        # 4. Perform the entire aggregation with a single, powerful SQL query
+        logger.info("Performing high-performance spatial join and aggregation... (This may take a moment)")
+        
+        # The geometry that the points will be joined against
+        join_geom = f"Transform(g.geom, {srid})" if needs_transform else "g.geom"
+
+        aggregation_query = f"""
+            SELECT
+                g.grid_id,
+                {agg_func.upper()}(p."{agg_col}") AS agg_value,
+                COUNT(p.rowid) AS point_count
+            FROM
+                grid_temp AS g
+            JOIN
+                processed_data AS p ON ST_Contains({join_geom}, p.geom)
+            GROUP BY
+                g.grid_id;
+        """
+        
+        agg_results_df = pd.read_sql(aggregation_query, self.engine)
+        logger.info(f"Aggregation complete. Found data in {len(agg_results_df)} grid cells.")
+
+        if agg_results_df.empty:
+            logger.warning("No data points fell within the grid. Cannot create map."); return None
+            
+        # 5. Merge the results back to the GeoDataFrame and create the map
+        grid_with_data = grid_gdf.merge(agg_results_df, on='grid_id')
+        grid_with_data.rename(columns={'agg_value': agg_col}, inplace=True)
+        
+        map_center = [grid_with_data.geometry.centroid.y.mean(), grid_with_data.geometry.centroid.x.mean()]
+        m = folium.Map(location=map_center, zoom_start=6, tiles='CartoDB positron')
+        
+        non_zero_data = grid_with_data[grid_with_data[agg_col] > 0]
+        min_val = non_zero_data[agg_col].min() if not non_zero_data.empty else 0
+        max_val = non_zero_data[agg_col].max() if not non_zero_data.empty else 0
+        if min_val == max_val: min_val = max_val * 0.9 if max_val > 0 else 0
+        colormap = cm.linear.YlOrRd_09.scale(min_val, max_val)
+        colormap.caption = f'{agg_func.capitalize()} of {agg_col} per Grid Cell'
+
+        def style_function(feature):
+            value = feature['properties'][agg_col]
+            if value > 0:
+                return {'fillColor': colormap(value), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
+            else:
+                return {'fillColor': '#D3D3D3', 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.5}
+
+        folium.GeoJson(grid_with_data, style_function=style_function, name='Aggregated Data',
+            tooltip=folium.GeoJsonTooltip(fields=['grid_id', agg_col, 'point_count'], aliases=['Grid ID:', f'{agg_col}:', 'Point Count:'], localize=True)
+        ).add_to(m)
+        colormap.add_to(m)
+        folium.LayerControl().add_to(m)
+        return m
+
+    def generate_grid_map(self, grid_cell_size_arg=None):
+        if not self.engine:
+            logger.warning("Cannot generate map: Database engine not available."); return None
+        logger.info("\n--- Generating map using high-performance arithmetic grid aggregation ---")
+        grid_cell_size_km = grid_cell_size_arg if grid_cell_size_arg is not None else config.GRID_CELL_SIZE
+        agg_col = config.AGGREGATION_COLUMN
+        agg_func = config.AGGREGATION_FUNCTION.lower()
+        
+        # 1. Get the data bounds from the pre-calculated coordinate columns.
+        logger.info("Calculating grid bounds from coordinate columns...")
+        with self.engine.connect() as conn:
+            query = text("SELECT MIN(longitude), MIN(latitude), MAX(longitude), MAX(latitude) FROM processed_data;")
+            try:
+                xmin, ymin, xmax, ymax = conn.execute(query).fetchone()
+            except sqlalchemy.exc.OperationalError as e:
+                logger.error(f"Could not calculate data bounds. Are longitude/latitude columns missing? Error: {e}"); return None
+
+        if not all((xmin, ymin, xmax, ymax)):
+            logger.warning("Could not determine data bounds from database. Cannot generate map."); return None
+
+        # 2. Construct and execute a single query that calculates grid indices and aggregates.
+        grid_cell_size_deg = grid_cell_size_km / 111.32
+        logger.info("Performing high-speed arithmetic aggregation in the database...")
+
+        # This query avoids all spatial operations and uses pure arithmetic for binning.
+        aggregation_query = f"""
+            SELECT
+                CAST(FLOOR((longitude - {xmin}) / {grid_cell_size_deg}) AS INTEGER) as grid_x_index,
+                CAST(FLOOR((latitude - {ymin}) / {grid_cell_size_deg}) AS INTEGER) as grid_y_index,
+                {agg_func.upper()}("{agg_col}") AS {agg_col},
+                COUNT(*) as point_count
+            FROM
+                processed_data
+            WHERE
+                longitude IS NOT NULL AND latitude IS NOT NULL
+            GROUP BY
+                grid_x_index, grid_y_index;
+        """
+        logger.info("Aggregation query:")
+        logger.info(aggregation_query)
+        
+        agg_results_df = pd.read_sql(aggregation_query, self.engine)
+        logger.info(f"Aggregation complete. Found data in {len(agg_results_df)} grid cells.")
+
+        if agg_results_df.empty:
+            logger.warning("No data points fell within the grid. Cannot create map."); return None
+            
+        # 3. In Python, reconstruct the grid cell polygons from the indices.
+        logger.info("Reconstructing grid geometries for mapping...")
+        geometries = []
+        for index, row in agg_results_df.iterrows():
+            ix, iy = row['grid_x_index'], row['grid_y_index']
+            cell_xmin = xmin + (ix * grid_cell_size_deg)
+            cell_ymin = ymin + (iy * grid_cell_size_deg)
+            cell_xmax = cell_xmin + grid_cell_size_deg
+            cell_ymax = cell_ymin + grid_cell_size_deg
+            geometries.append(Polygon([(cell_xmin, cell_ymin), (cell_xmax, cell_ymin), (cell_xmax, cell_ymax), (cell_xmin, cell_ymax)]))
+
+        # 4. Create the final GeoDataFrame
+        grid_with_data = gpd.GeoDataFrame(
+            agg_results_df,
+            geometry=geometries,
+            crs='EPSG:4326'
+        )
+        
+        # 5. Create the map using the robust manual styling method
+        map_center = [grid_with_data.geometry.centroid.y.mean(), grid_with_data.geometry.centroid.x.mean()]
+        m = folium.Map(location=map_center, zoom_start=6, tiles='CartoDB positron')
+        
+        non_zero_data = grid_with_data[grid_with_data[agg_col] > 0]
+        min_val = non_zero_data[agg_col].min() if not non_zero_data.empty else 0
+        max_val = non_zero_data[agg_col].max() if not non_zero_data.empty else 0
+        if min_val == max_val: min_val = max_val * 0.9 if max_val > 0 else 0
+        colormap = cm.linear.YlOrRd_09.scale(min_val, max_val)
+        colormap.caption = f'{agg_func.capitalize()} of {agg_col} per Grid Cell'
+
+        def style_function(feature):
+            value = feature['properties'][agg_col]
+            if value > 0:
+                return {'fillColor': colormap(value), 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.7}
+            else:
+                return {'fillColor': '#D3D3D3', 'color': 'black', 'weight': 0.5, 'fillOpacity': 0.5}
+
         folium.GeoJson(grid_with_data, style_function=style_function, name='Aggregated Data',
             tooltip=folium.GeoJsonTooltip(fields=[agg_col, 'point_count'], aliases=[f'{agg_col}:', 'Point Count:'], localize=True)
         ).add_to(m)
