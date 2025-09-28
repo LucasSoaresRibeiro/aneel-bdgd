@@ -9,7 +9,9 @@ It uses the official ANEEL Open Data API to find and download File Geodatabase (
 - [aneel_bdgd_ceral_1km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_1km.html)
 - [aneel_bdgd_ceral_5km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_5km.html)
 - [aneel_bdgd_ceral_10km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_10km.html)
+- [aneel_bdgd_ceral_20km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_ceral_20km.html)
 - [aneel_bdgd_energisa_10km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_energisa_10km.html)
+- [aneel_bdgd_energisa_20km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_energisa_20km.html)
 - [aneel_bdgd_energisa_30km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_energisa_30km.html)
 - [aneel_bdgd_energisa_50km](https://lucassoaresribeiro.github.io/aneel-bdgd/output/aneel_bdgd_energisa_50km.html)
 
@@ -98,12 +100,14 @@ Before downloading, you can find out what datasets are available.
     -   This script automatically activates the correct Conda environment and runs the `main.py` script.
     -   You can also run it from the command line and pass optional parameters to override the settings in `config.py`.
     -   **Examples:**
-        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2023" "1" "output/aneel_bdgd_ceral_1km.html"`
-        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2023" "5" "output/aneel_bdgd_ceral_5km.html"`
-        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2023" "10" "output/aneel_bdgd_ceral_10km.html"`
-        -   `.\run_mapper.bat "ENERGISA_AC" "2024-12-31" "10" "output/aneel_bdgd_energisa_10km.html"`
-        -   `.\run_mapper.bat "ENERGISA_AC" "2024-12-31" "30" "output/aneel_bdgd_energisa_30km.html"`
-        -   `.\run_mapper.bat "ENERGISA_AC" "2024-12-31" "50" "output/aneel_bdgd_energisa_50km.html"`
+        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2024" "1" "output/aneel_bdgd_ceral_1km.html"`
+        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2024" "5" "output/aneel_bdgd_ceral_5km.html"`
+        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2024" "10" "output/aneel_bdgd_ceral_10km.html"`
+        -   `.\run_mapper.bat "CERAL_ARARUAMA" "2024" "20" "output/aneel_bdgd_ceral_20km.html"`
+        -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "10" "output/aneel_bdgd_energisa_10km.html"`
+        -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "20" "output/aneel_bdgd_energisa_20km.html"`
+        -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "30" "output/aneel_bdgd_energisa_30km.html"`
+        -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "50" "output/aneel_bdgd_energisa_50km.html"`
         -   `.\run_mapper.bat --company_filter "ENERGISA"` (only overrides the company filter)
 2.  The script will start the full process based on your `config.py` settings (or overridden parameters):
     -   It will download the filtered `.zip` files.

@@ -49,4 +49,8 @@ ECHO.
 ECHO.
 ECHO --- Script Finished ---
 
+if not "%~4"=="" (
+    start "" "%~4"
+)
+
 endlocal
