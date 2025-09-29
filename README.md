@@ -108,6 +108,8 @@ Before downloading, you can find out what datasets are available.
         -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "20" "output/aneel_bdgd_energisa_20km.html"`
         -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "30" "output/aneel_bdgd_energisa_30km.html"`
         -   `.\run_mapper.bat "ENERGISA_AC" "2023-12-31" "50" "output/aneel_bdgd_energisa_50km.html"`
+        -   `.\run_mapper.bat "EDP_SP" "2024-12-31" "10" "output/aneel_bdgd_energisa_10km.html"`
+        -   `.\run_mapper.bat "LIGHT" "2023-12-31" "10" "output/aneel_bdgd_energisa_10km.html"`
         -   `.\run_mapper.bat --company_filter "ENERGISA"` (only overrides the company filter)
 2.  The script will start the full process based on your `config.py` settings (or overridden parameters):
     -   It will download the filtered `.zip` files.
